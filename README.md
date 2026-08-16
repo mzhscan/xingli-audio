@@ -28,7 +28,7 @@
 
 ### 1. 下载
 
-到 [Releases](../../releases) 页面下载最新的 `星黎音频.exe`（单文件，~46 MB）。
+到 [Releases](../../releases) 页面下载最新的 `xingli-audio.exe`（单文件，~46 MB，本地可以重命名为 `星黎音频.exe`）。
 
 ### 2. 首次运行
 
@@ -52,6 +52,7 @@
 - **设备切换**：按下热键瞬间切换系统默认输出设备，同时（可选）弹出通知
 - **配置位置**：与 .exe 同目录的 `config.json`（便携），删除后下次启动恢复默认
 - **开机自启**：勾选后写入注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- **本地重命名**：从 GitHub 下载后是 `xingli-audio.exe`，你可以把它改名成 `星黎音频.exe`，所有功能照常工作
 
 ## 开发
 
