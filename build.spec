@@ -30,6 +30,7 @@ hiddenimports = [
     "PySide6.QtWidgets",
     "PySide6.QtGui",
     "PySide6.QtCore",
+    "PySide6.QtNetwork",  # QLocalServer/QLocalSocket (单实例锁)
 ]
 
 # On Windows, subsystem='windows' => no console window
