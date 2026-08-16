@@ -1,8 +1,9 @@
 """星黎音频 - Windows 输出设备枚举与切换。
 
 实现要点:
-  * 枚举: pycaw.utils.AudioUtilities.GetAllDevices() (高层, 名字/状态直接是属性)
+  * 枚举: IMMDeviceEnumerator.EnumAudioEndpoints (直接 COM, 不走高层 utils)
   * 切换默认设备: IPolicyConfig::SetDefaultEndpoint (eConsole/eMultimedia/eCommunications 三种 role)
+  * 设备热插拔监听: pycaw.MMNotificationClient (outgoing COM 接口)
 """
 from __future__ import annotations
 
@@ -17,18 +18,12 @@ if sys.platform != "win32":
 import comtypes  # noqa: E402
 from ctypes import HRESULT, c_int, c_void_p, c_wchar_p  # noqa: E402
 from comtypes import COMMETHOD, GUID, IUnknown  # noqa: E402
+from PySide6.QtCore import QObject, Q_ARG, QMetaObject, Qt, Signal  # noqa: E402
 
 # pycaw 底层 COM 接口
 from pycaw.pycaw import (  # noqa: E402
     EDataFlow, ERole, IMMDeviceEnumerator, IPropertyStore, PROPERTYKEY,
 )
-# pycaw 高层 (新版本在 utils)
-try:  # noqa: E402
-    from pycaw.utils import AudioUtilities  # type: ignore
-    from pycaw.utils import AudioDeviceState as _ActiveState  # type: ignore
-except ImportError:  # pragma: no cover
-    from pycaw.pycaw import AudioUtilities  # type: ignore
-    from pycaw.pycaw import AudioDeviceState as _ActiveState  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -277,3 +272,122 @@ def get_default_output_device_id() -> str:
                 pass
     except Exception:  # pragma: no cover
         return ""
+
+
+# ---------------------------------------------------------------------------
+# 设备热插拔监听: IMMNotificationClient
+#
+# Windows 设备插/拔/启用/禁用/默认设备变化 都会通过这个 COM 回调通知。
+# 我们继承 pycaw 已有的 MMNotificationClient (它已正确设置了 _com_interfaces_,
+# 可以作为 outgoing interface 的 coclass 实例), 然后通过 PySide6 Signal
+# 跨线程 marshal 到 Qt 主线程。
+# ---------------------------------------------------------------------------
+from pycaw.callbacks import MMNotificationClient  # noqa: E402
+
+# Reason 常量 (DeviceCombo 收到信号后可以按需区分, 这里统一发一个简单信号)
+DEVICE_CHANGE_REASON_DEFAULT = "default"
+DEVICE_CHANGE_REASON_ADDED = "added"
+DEVICE_CHANGE_REASON_REMOVED = "removed"
+DEVICE_CHANGE_REASON_STATE = "state"
+
+
+class _NotificationSink(MMNotificationClient):
+    """COM 回调接收器: Windows 在自己的线程触发回调, 我们通过 DeviceNotifier
+    的 Qt Signal 跨线程 marshal 到主线程 (Qt AutoConnection 自动 Queue)。
+    """
+
+    def __init__(self, notifier: "DeviceNotifier") -> None:
+        super().__init__()
+        self._notifier = notifier
+
+    # ---- pycaw 的 MMNotificationClient 把 5 个 COM 回调映射到 pythonic 的 on_* ----
+    def on_default_device_changed(self, flow, flow_id, role, role_id, default_device_id):
+        # 只关心 render (输出) 设备
+        if flow_id == 0:  # EDataFlow.eRender
+            self._notifier._post_change(DEVICE_CHANGE_REASON_DEFAULT)
+
+    def on_device_added(self, added_device_id):
+        self._notifier._post_change(DEVICE_CHANGE_REASON_ADDED)
+
+    def on_device_removed(self, removed_device_id):
+        self._notifier._post_change(DEVICE_CHANGE_REASON_REMOVED)
+
+    def on_device_state_changed(self, device_id, new_state, new_state_id):
+        self._notifier._post_change(DEVICE_CHANGE_REASON_STATE)
+
+    def on_property_value_changed(self, device_id, property_struct, fmtid, pid):
+        # 改名 / 设备属性变化, 也触发刷新
+        self._notifier._post_change(DEVICE_CHANGE_REASON_STATE)
+
+
+class DeviceNotifier(QObject):
+    """监听音频设备热插拔 / 状态变化, 发出 Qt 信号让 UI 刷新。
+
+    用法:
+        notifier = DeviceNotifier()
+        notifier.deviceChanged.connect(some_slot)
+        notifier.start()    # 注册 COM 回调
+        ...
+        notifier.stop()     # 取消注册 (进程退出时不必显式调用)
+    """
+
+    # reason: 字符串常量之一 (DEVICE_CHANGE_REASON_*)
+    deviceChanged = Signal(str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._enumerator = None  # type: ignore[var-annotated]
+        self._sink = None  # type: ignore[var-annotated]
+        self._registered = False
+
+    def start(self) -> bool:
+        """注册 COM 回调, 开始监听设备变化。失败 (e.g. 权限) 返回 False。"""
+        _ensure_com()
+        try:
+            enumerator = comtypes.CoCreateInstance(
+                _CLSID_MMDeviceEnumerator,
+                IMMDeviceEnumerator,
+                comtypes.CLSCTX_INPROC_SERVER,
+            )
+            sink = _NotificationSink(self)
+            enumerator.RegisterEndpointNotificationCallback(sink)
+            self._enumerator = enumerator
+            self._sink = sink
+            self._registered = True
+            return True
+        except Exception as e:
+            print(f"[DeviceNotifier] 注册失败: {e}")
+            self._enumerator = None
+            self._sink = None
+            self._registered = False
+            return False
+
+    def stop(self) -> None:
+        """取消注册, 不再监听。"""
+        if not self._registered:
+            return
+        try:
+            if self._enumerator is not None and self._sink is not None:
+                self._enumerator.UnregisterEndpointNotificationCallback(self._sink)
+        except Exception as e:
+            print(f"[DeviceNotifier] 注销失败: {e}")
+        finally:
+            self._enumerator = None
+            self._sink = None
+            self._registered = False
+
+    def _post_change(self, reason: str) -> None:
+        """COM 线程触发, 通过 QMetaObject.invokeMethod 跨线程 emit。
+        绝对不能在 COM 线程直接 self.signal.emit(): Qt 不允许在非
+        所属线程 emit, 会 crash (0xC0000005)。QueuedConnection 会把
+        emit 排到 DeviceNotifier 所属的线程 (创建时所在 = 主线程) 再执行。
+        """
+        try:
+            QMetaObject.invokeMethod(
+                self,
+                "deviceChanged",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, reason),
+            )
+        except Exception as e:
+            print(f"[DeviceNotifier] invokeMethod 失败: {e}")
